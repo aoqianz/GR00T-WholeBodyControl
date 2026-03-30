@@ -11,9 +11,50 @@ Usage:
 """
 
 import argparse
+import os
 import shutil
 import sys
 from pathlib import Path
+
+# Env keys that route traffic through a proxy (huggingface_hub/httpx reads these).
+_PROXY_ENV_KEYS = (
+    "HTTP_PROXY",
+    "http_proxy",
+    "HTTPS_PROXY",
+    "https_proxy",
+    "ALL_PROXY",
+    "all_proxy",
+)
+
+
+def _env_uses_socks_proxy():
+    for key in _PROXY_ENV_KEYS:
+        val = os.environ.get(key) or ""
+        if val.lower().startswith(("socks://", "socks4://", "socks5://")):
+            return True
+    return False
+
+
+def _clear_proxy_env():
+    for key in _PROXY_ENV_KEYS:
+        os.environ.pop(key, None)
+
+
+def _normalize_socks_proxy_env():
+    """Map socks:// → socks5://; httpx only allows http, https, socks5 (not generic socks)."""
+    for key in _PROXY_ENV_KEYS:
+        val = os.environ.get(key)
+        if not val:
+            continue
+        v = val.strip()
+        sep = "://"
+        i = v.lower().find(sep)
+        if i == -1:
+            continue
+        scheme = v[:i].lower()
+        if scheme == "socks":
+            os.environ[key] = "socks5" + v[i:]
+
 
 REPO_ID = "nvidia/GEAR-SONIC"
 
@@ -50,6 +91,14 @@ def parse_args():
         default=None,
         help="Hugging Face token (or set HF_TOKEN env var / run huggingface-cli login)",
     )
+    parser.add_argument(
+        "--no-proxy",
+        action="store_true",
+        help=(
+            "Unset HTTP(S)/ALL_PROXY for this run (use if SOCKS proxy breaks httpx; "
+            "or install: pip install 'httpx[socks]')"
+        ),
+    )
     return parser.parse_args()
 
 
@@ -66,11 +115,22 @@ def _ensure_huggingface_hub():
 def download_file(hf_hub_download, repo_id, hf_filename, local_dest, token=None):
     """Download hf_filename from the Hub and place it at local_dest."""
     print(f"  Downloading {hf_filename} ...", flush=True)
-    cached = hf_hub_download(
-        repo_id=repo_id,
-        filename=hf_filename,
-        token=token,
-    )
+    try:
+        cached = hf_hub_download(
+            repo_id=repo_id,
+            filename=hf_filename,
+            token=token,
+        )
+    except ValueError as e:
+        if "Unknown scheme for proxy URL" in str(e):
+            print(
+                "\nProxy URL not accepted by httpx. Try:\n"
+                "  pip install 'httpx[socks]'   # if using SOCKS\n"
+                "  Use socks5://... in ALL_PROXY (not socks://), or run:\n"
+                "  python download_from_hf.py --no-proxy\n",
+                file=sys.stderr,
+            )
+        raise
     local_dest.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(cached, local_dest)
     print(f"  -> {local_dest}")
@@ -78,6 +138,21 @@ def download_file(hf_hub_download, repo_id, hf_filename, local_dest, token=None)
 
 def main():
     args = parse_args()
+    if args.no_proxy:
+        _clear_proxy_env()
+    else:
+        _normalize_socks_proxy_env()
+        if _env_uses_socks_proxy():
+            try:
+                import socksio  # noqa: F401 — optional extra for httpx[socks]
+            except ImportError:
+                print(
+                    "Note: SOCKS proxy is set. If download fails:\n"
+                    "  pip install 'httpx[socks]'\n"
+                    "  python download_from_hf.py --no-proxy\n",
+                    flush=True,
+                )
+
     hf_hub_download = _ensure_huggingface_hub()
 
     repo_root = Path(__file__).resolve().parent

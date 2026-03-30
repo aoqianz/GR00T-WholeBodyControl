@@ -208,9 +208,13 @@ show_usage() {
     echo "  --obs-config PATH       Set the observation config file (default: policy/configs/example.yaml)"
     echo "  --planner PATH          Set the planner model path (default: planner/example.onnx)"
     echo "  --motion-data PATH      Set the motion data path (default: reference/example_motion/)"
-    echo "  --input-type TYPE       Set the input type (default: zmq_manager)"
+    echo "  --input-type TYPE       Set the input type (default: manager)"
     echo "  --output-type TYPE      Set the output type (default: ros2)"
     echo "  --zmq-host HOST         Set the ZMQ host (default: localhost)"
+    echo "  --zmq-port PORT         ZMQ SUB port (default: 5556). Must use this flag — not positional."
+    echo "  --zmq-topic TOPIC       Pose topic for zmq / zmq_manager (default: pose)"
+    echo "  --zmq-conflate          Enable ZMQ CONFLATE on pose subscription"
+    echo "  --zmq-verbose           Verbose ZMQ logging"
     echo ""
     echo "Interface modes:"
     echo "  sim              Use loopback interface for simulation (MuJoCo)"
@@ -229,6 +233,7 @@ show_usage() {
     echo "  $0 --obs-config policy/configs/custom.yaml sim  # Use custom obs config"
     echo "  $0 --planner planner/custom.onnx --input-type keyboard real  # Use custom planner and input"
     echo "  $0 --motion-data reference/custom_motion/ sim  # Use custom motion data"
+    echo "  $0 real --input-type zmq_manager --zmq-host 127.0.0.1 --zmq-port 5556"
 }
 
 # Default interface mode
@@ -242,6 +247,8 @@ MOTION_DATA_DEFAULT="reference/example/"
 INPUT_TYPE_DEFAULT="manager"
 OUTPUT_TYPE_DEFAULT="all"
 ZMQ_HOST_DEFAULT="localhost"
+ZMQ_PORT_DEFAULT="5556"
+ZMQ_TOPIC_DEFAULT="pose"
 
 # Initialize with defaults (will be set after parsing)
 CHECKPOINT="$CHECKPOINT_DEFAULT"
@@ -251,6 +258,10 @@ MOTION_DATA="$MOTION_DATA_DEFAULT"
 INPUT_TYPE="$INPUT_TYPE_DEFAULT"
 OUTPUT_TYPE="$OUTPUT_TYPE_DEFAULT"
 ZMQ_HOST="$ZMQ_HOST_DEFAULT"
+ZMQ_PORT="$ZMQ_PORT_DEFAULT"
+ZMQ_TOPIC="$ZMQ_TOPIC_DEFAULT"
+ZMQ_CONFLATE="0"
+ZMQ_VERBOSE="0"
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -315,12 +326,46 @@ while [[ $# -gt 0 ]]; do
             ZMQ_HOST="$2"
             shift 2
             ;;
+        --zmq-port)
+            if [[ -z "$2" ]]; then
+                echo -e "${RED}Error: --zmq-port requires a port argument${NC}" >&2
+                exit 1
+            fi
+            ZMQ_PORT="$2"
+            shift 2
+            ;;
+        --zmq-topic)
+            if [[ -z "$2" ]]; then
+                echo -e "${RED}Error: --zmq-topic requires a topic argument${NC}" >&2
+                exit 1
+            fi
+            ZMQ_TOPIC="$2"
+            shift 2
+            ;;
+        --zmq-conflate)
+            ZMQ_CONFLATE="1"
+            shift
+            ;;
+        --zmq-verbose)
+            ZMQ_VERBOSE="1"
+            shift
+            ;;
         sim|real)
             INTERFACE_MODE="$1"
             shift
             ;;
         *)
-            # Could be interface name or IP
+            if [[ "$1" == -* ]]; then
+                echo -e "${RED}Error: unknown option: $1${NC}" >&2
+                echo "  Run $0 --help. For ZMQ port use --zmq-port (it is not a positional argument)." >&2
+                exit 1
+            fi
+            if [[ "$1" =~ ^[0-9]+$ ]] && (( 10#$1 >= 1 && 10#$1 <= 65535 )); then
+                echo -e "${RED}Error: '$1' looks like a TCP port, not a DDS network interface.${NC}" >&2
+                echo "  Pass robot NIC or 'real'|'sim' as the interface token, e.g.:" >&2
+                echo "    $0 real --input-type zmq_manager --zmq-host 127.0.0.1 --zmq-port $1" >&2
+                exit 1
+            fi
             INTERFACE_MODE="$1"
             shift
             ;;
@@ -343,6 +388,12 @@ echo -e "${NC}"
 
 echo -e "${BLUE}[Interface Resolution]${NC}"
 echo "Requested mode: $INTERFACE_MODE"
+
+if [[ "$INTERFACE_MODE" == -* ]]; then
+    echo -e "${RED}Error: invalid interface mode '${INTERFACE_MODE}'.${NC}" >&2
+    echo "  Likely cause: an unrecognized flag was parsed as the interface. End with: real  or  sim  or  eth0" >&2
+    exit 1
+fi
 
 resolve_interface "$INTERFACE_MODE"
 
@@ -499,6 +550,10 @@ echo ""
 # Step 4: Deploy
 # ============================================================================
 
+ZMQ_OPT_EXTRA=()
+[[ "$ZMQ_CONFLATE" == "1" ]] && ZMQ_OPT_EXTRA+=(--zmq-conflate)
+[[ "$ZMQ_VERBOSE" == "1" ]] && ZMQ_OPT_EXTRA+=(--zmq-verbose)
+
 echo -e "${BLUE}[Step 4/4]${NC} Ready to deploy!"
 echo ""
 echo -e "${CYAN}═══════════════════════════════════════════════════════════════════════${NC}"
@@ -515,6 +570,10 @@ echo -e "  Planner:            ${GREEN}$PLANNER${NC}"
 echo -e "  Input Type:         ${GREEN}$INPUT_TYPE${NC}"
 echo -e "  Output Type:        ${GREEN}$OUTPUT_TYPE${NC}"
 echo -e "  ZMQ Host:           ${GREEN}$ZMQ_HOST${NC}"
+echo -e "  ZMQ Port:           ${GREEN}$ZMQ_PORT${NC}"
+echo -e "  ZMQ Topic:          ${GREEN}$ZMQ_TOPIC${NC}"
+[[ "$ZMQ_CONFLATE" == "1" ]] && echo -e "  ZMQ Conflate:       ${GREEN}on${NC}"
+[[ "$ZMQ_VERBOSE" == "1" ]] && echo -e "  ZMQ Verbose:        ${GREEN}on${NC}"
 if [[ -n "$EXTRA_ARGS" ]]; then
 echo -e "  Extra Args:         ${GREEN}$EXTRA_ARGS${NC}"
 fi
@@ -529,7 +588,12 @@ echo -e "${BLUE}    --encoder-file $CHECKPOINT_ENCODER \\${NC}"
 echo -e "${BLUE}    --planner-file $PLANNER \\${NC}"
 echo -e "${BLUE}    --input-type $INPUT_TYPE \\${NC}"
 echo -e "${BLUE}    --output-type $OUTPUT_TYPE \\${NC}"
-echo -e "${BLUE}    --zmq-host $ZMQ_HOST${NC}"
+echo -e "${BLUE}    --zmq-host $ZMQ_HOST \\${NC}"
+echo -e "${BLUE}    --zmq-port $ZMQ_PORT \\${NC}"
+echo -e "${BLUE}    --zmq-topic $ZMQ_TOPIC${NC}"
+if [[ ${#ZMQ_OPT_EXTRA[@]} -gt 0 ]]; then
+echo -e "${BLUE}    ${ZMQ_OPT_EXTRA[*]}${NC}"
+fi
 if [[ -n "$EXTRA_ARGS" ]]; then
 echo -e "${BLUE}    $EXTRA_ARGS${NC}"
 fi
@@ -560,6 +624,9 @@ if [[ "$confirm" =~ ^[Yy]$ ]] || [[ -z "$confirm" ]]; then
             --input-type "$INPUT_TYPE" \
             --output-type "$OUTPUT_TYPE" \
             --zmq-host "$ZMQ_HOST" \
+            --zmq-port "$ZMQ_PORT" \
+            --zmq-topic "$ZMQ_TOPIC" \
+            "${ZMQ_OPT_EXTRA[@]}" \
             $EXTRA_ARGS
     else
         just run g1_deploy_onnx_ref "$TARGET" "$CHECKPOINT_DECODER" "$MOTION_DATA" \
@@ -568,7 +635,10 @@ if [[ "$confirm" =~ ^[Yy]$ ]] || [[ -z "$confirm" ]]; then
             --planner-file "$PLANNER" \
             --input-type "$INPUT_TYPE" \
             --output-type "$OUTPUT_TYPE" \
-            --zmq-host "$ZMQ_HOST"
+            --zmq-host "$ZMQ_HOST" \
+            --zmq-port "$ZMQ_PORT" \
+            --zmq-topic "$ZMQ_TOPIC" \
+            "${ZMQ_OPT_EXTRA[@]}"
     fi
 else
     echo ""

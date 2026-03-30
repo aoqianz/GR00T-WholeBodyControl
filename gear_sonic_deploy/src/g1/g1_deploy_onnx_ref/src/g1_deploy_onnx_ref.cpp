@@ -39,7 +39,7 @@
  *   --obs-config          | Observation config YAML
  *   --encoder-model       | Encoder ONNX model (for token_state)
  *   --planner-model       | Locomotion planner ONNX model
- *   --input-type          | keyboard / gamepad / zmq / ros2 / interface_manager / gamepad_manager / zmq_manager
+ *   --input-type          | keyboard / gamepad / zmq / televuer / ros2 / manager / gamepad_manager / zmq_manager
  *   --output-type         | zmq / ros2 / all
  *   --disable-crc-check   | Skip CRC validation (for MuJoCo sim)
  *   --planner-fp16        | Use FP16 for planner TensorRT engine
@@ -109,6 +109,7 @@
 #include "../include/input_interface/interface_manager.hpp"
 #include "../include/input_interface/gamepad_manager.hpp"
 #include "../include/input_interface/zmq_manager.hpp"
+#include "../include/input_interface/televuer_planner_input.hpp"
 
 // Output interface and output handlers
 #include "../include/output_interface/output_interface.hpp"
@@ -2156,7 +2157,10 @@ class G1Deploy {
       std::string zmq_out_topic = "g1_debug",
       bool enable_motion_recording = false,
       std::array<double, 3> initial_compliance = {0.05, 0.05, 0.0},
-      double initial_max_close_ratio = 1.0)
+      double initial_max_close_ratio = 1.0,
+      std::string televuer_ipc = "/tmp/televuer_teledata.sock",
+      std::string televuer_topic = "televuer.teledata",
+      bool televuer_disable_joystick = false)
       : time_(0.0),
         publish_dt_(0.002),
         control_dt_(0.02),
@@ -2493,6 +2497,16 @@ class G1Deploy {
         std::cout << "  Command topic: command" << std::endl;
         std::cout << "  Planner topic: planner" << std::endl;
         std::cout << "  Conflate: " << (zmq_conflate ? "enabled" : "disabled") << std::endl;
+        std::cout << "  Initial encoder mode: " << initial_encoder_mode_ << std::endl;
+      }
+      else if (input_type == "televuer") {
+        input_interface_ = std::make_unique<TeleVuerPlannerInput>(
+            televuer_ipc, televuer_topic, televuer_disable_joystick, zmq_verbose);
+        std::cout << "Initialized TeleVuer IPC input (direct planner + VR 3-point, no Python bridge)" << std::endl;
+        std::cout << "  IPC socket path: " << televuer_ipc << std::endl;
+        std::cout << "  ZMQ SUB topic: " << televuer_topic << std::endl;
+        std::cout << "  Controller joystick locomotion: "
+                  << (televuer_disable_joystick ? "disabled" : "enabled") << std::endl;
         std::cout << "  Initial encoder mode: " << initial_encoder_mode_ << std::endl;
       }
 #if HAS_ROS2
@@ -4100,7 +4114,7 @@ int main(int argc, char const* argv[]) {
     std::cout << "  motion_data_path: path to motion data directory (e.g., reference/bones_072925_test/)" << std::endl;
     std::cout << "\nOptions:" << std::endl;
     std::cout << "  --planner-file <path>: specify planner file (optional)" << std::endl;
-    std::cout << "  --input-type <keyboard|gamepad|gamepad_manager|manager|zmq|zmq_manager";
+    std::cout << "  --input-type <keyboard|gamepad|gamepad_manager|manager|zmq|zmq_manager|televuer";
 #if HAS_ROS2
     std::cout << "|ros2";
 #endif
@@ -4123,6 +4137,9 @@ int main(int argc, char const* argv[]) {
     std::cout << "  --zmq-topic <topic>: ZMQ topic/prefix (default: pose)" << std::endl;
     std::cout << "  --zmq-conflate: enable ZMQ CONFLATE (default: disabled)" << std::endl;
     std::cout << "  --zmq-verbose: enable ZMQ subscriber verbose logs" << std::endl;
+    std::cout << "  --televuer-ipc <path>: TeleVuer IPC socket path (default: /tmp/televuer_teledata.sock)" << std::endl;
+    std::cout << "  --televuer-topic <str>: ZMQ SUB topic prefix for TeleVuer multipart stream (default: televuer.teledata)" << std::endl;
+    std::cout << "  --televuer-disable-joystick: ignore controller thumbsticks (VR poses only)" << std::endl;
     std::cout << "  --zmq-out-port <port>: ZMQ port for output (default: 5557)" << std::endl;
     std::cout << "  --zmq-out-topic <topic>: ZMQ topic/prefix for output (default: g1_debug)" << std::endl;
     std::cout << "  --logs-dir <path>: optional logs output base directory (default: logs/<timestamp>/)" << std::endl;
@@ -4141,6 +4158,7 @@ int main(int argc, char const* argv[]) {
     std::cout << "  " << argv[0] << " enp5s0 policy/single_frame/model.onnx reference/bones_072925_test/ --input-type gamepad_manager --planner-file policy/planner.onnx --zmq-host localhost --zmq-port 5556" << std::endl;
     std::cout << "  " << argv[0] << " enp5s0 policy/single_frame/model.onnx reference/bones_072925_test/ --input-type zmq --zmq-host 192.168.1.2 --zmq-port 5556 --zmq-topic pose --zmq-conflate" << std::endl;
     std::cout << "  " << argv[0] << " enp5s0 policy/single_frame/model.onnx reference/bones_072925_test/ --input-type zmq_manager --planner-file policy/planner.onnx --zmq-host localhost --zmq-port 5556" << std::endl;
+    std::cout << "  " << argv[0] << " enp5s0 policy/single_frame/model.onnx reference/bones_072925_test/ --input-type televuer --planner-file policy/planner.onnx" << std::endl;
 #if HAS_ROS2
     std::cout << "  " << argv[0] << " enp5s0 policy/single_frame/model.onnx reference/bones_072925_test/ --input-type ros2 --planner-file policy/planner.onnx" << std::endl;
 #endif
@@ -4153,7 +4171,7 @@ int main(int argc, char const* argv[]) {
   std::string plannerFile = "";
 
   // Parse optional arguments
-  bool disableCrcCheck = false;\
+  bool disableCrcCheck = false;
   std::string obsConfigPath = "";
   std::string encoderFile = "";
   std::string targetMotionLogfile = "";
@@ -4177,6 +4195,9 @@ int main(int argc, char const* argv[]) {
   std::string zmq_out_topic = "g1_debug";
   std::array<double, 3> initial_compliance = {0.5, 0.5, 0.0}; // initial compliance is 0.5 for both hands (keyboard controllable)
   double initial_max_close_ratio = 1.0; // default allows full closure, use --max-close-ratio to limit
+  std::string televuer_ipc = "/tmp/televuer_teledata.sock";
+  std::string televuer_topic = "televuer.teledata";
+  bool televuer_disable_joystick = false;
   for (int i = 4; i < argc; i++) {
     if (std::string(argv[i]) == "--disable-crc-check") {
       disableCrcCheck = true;
@@ -4230,12 +4251,12 @@ int main(int argc, char const* argv[]) {
       if (i + 1 < argc) {
         inputType = argv[i + 1];
         // Validate input type based on what's available
-        bool valid_input = (inputType == "keyboard" || inputType == "gamepad" || inputType == "gamepad_manager" || inputType == "zmq" || inputType == "zmq_manager" || inputType == "manager");
+        bool valid_input = (inputType == "keyboard" || inputType == "gamepad" || inputType == "gamepad_manager" || inputType == "zmq" || inputType == "zmq_manager" || inputType == "manager" || inputType == "televuer");
 #if HAS_ROS2
         valid_input = valid_input || (inputType == "ros2");
 #endif
         if (!valid_input) {
-          std::cerr << "Error: --input-type must be 'keyboard', 'gamepad', 'gamepad_manager', 'manager', 'zmq', or 'zmq_manager'";
+          std::cerr << "Error: --input-type must be 'keyboard', 'gamepad', 'gamepad_manager', 'manager', 'zmq', 'zmq_manager', or 'televuer'";
 #if HAS_ROS2
           std::cerr << ", or 'ros2'";
 #endif
@@ -4245,7 +4266,7 @@ int main(int argc, char const* argv[]) {
         std::cout << "[INFO] Using input type: " << inputType << std::endl;
         i++; // Skip the next argument since it's the input type
       } else {
-        std::cerr << "Error: --input-type requires a type argument (keyboard, gamepad, gamepad_manager, manager, zmq, zmq_manager";
+        std::cerr << "Error: --input-type requires a type argument (keyboard, gamepad, gamepad_manager, manager, zmq, zmq_manager, televuer";
 #if HAS_ROS2
         std::cerr << ", or ros2";
 #endif
@@ -4351,6 +4372,27 @@ int main(int argc, char const* argv[]) {
       zmq_conflate = true;
     } else if (std::string(argv[i]) == "--zmq-verbose") {
       zmq_verbose = true;
+    } else if (std::string(argv[i]) == "--televuer-ipc") {
+      if (i + 1 < argc) {
+        televuer_ipc = argv[i + 1];
+        std::cout << "[INFO] TeleVuer IPC path: " << televuer_ipc << std::endl;
+        i++;
+      } else {
+        std::cerr << "Error: --televuer-ipc requires a path argument" << std::endl;
+        exit(1);
+      }
+    } else if (std::string(argv[i]) == "--televuer-topic") {
+      if (i + 1 < argc) {
+        televuer_topic = argv[i + 1];
+        std::cout << "[INFO] TeleVuer ZMQ topic: " << televuer_topic << std::endl;
+        i++;
+      } else {
+        std::cerr << "Error: --televuer-topic requires an argument" << std::endl;
+        exit(1);
+      }
+    } else if (std::string(argv[i]) == "--televuer-disable-joystick") {
+      televuer_disable_joystick = true;
+      std::cout << "[INFO] TeleVuer controller joystick locomotion disabled" << std::endl;
     } else if (std::string(argv[i]) == "--enable-motion-recording") {
       enableMotionRecording = true;
       std::cout << "[INFO] Motion recording enabled" << std::endl;
@@ -4438,7 +4480,10 @@ int main(int argc, char const* argv[]) {
     zmq_out_topic,
     enableMotionRecording,
     initial_compliance,
-    initial_max_close_ratio
+    initial_max_close_ratio,
+    televuer_ipc,
+    televuer_topic,
+    televuer_disable_joystick
   );
   std::cout << "[DEBUG] G1Deploy object created successfully!" << std::endl;
   

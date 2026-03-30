@@ -1,0 +1,108 @@
+/**
+ * @file televuer_planner_input.hpp
+ * @brief Direct TeleVuer ZMQ IPC JSON → planner + VR 3-point (no Python bridge).
+ *
+ * Subscribes to the same multipart stream as teleop/televuer (topic + JSON body):
+ *   head_pose, left_wrist_pose, right_wrist_pose with 4x4 "matrix".
+ * Optional controller thumbsticks map to locomotion (matches televr_sonic_zmq_bridge.py).
+ *
+ * Wire format: televuer/zmq_wrapper.py TeleDataZmqPublisher._build_payload
+ */
+
+#ifndef TELEVUER_PLANNER_INPUT_HPP
+#define TELEVUER_PLANNER_INPUT_HPP
+
+#include <atomic>
+#include <chrono>
+#include <mutex>
+#include <string>
+
+#include "input_interface.hpp"
+#include "input_command.hpp"
+
+struct zmq_ctx_t;
+struct zmq_socket_t;
+
+/**
+ * @class TeleVuerPlannerInput
+ * @brief PLANNER-mode input from TeleVuer IPC JSON only (no TCP command/planner topics).
+ */
+class TeleVuerPlannerInput : public InputInterface {
+ public:
+  TeleVuerPlannerInput(
+      std::string ipc_path,
+      std::string topic = "televuer.teledata",
+      bool disable_joystick_locomotion = false,
+      bool zmq_verbose = false);
+
+  ~TeleVuerPlannerInput() override;
+
+  void update() override;
+
+  void handle_input(MotionDataReader& motion_reader,
+                    std::shared_ptr<const MotionSequence>& current_motion,
+                    int& current_frame,
+                    OperatorState& operator_state,
+                    bool& reinitialize_heading,
+                    DataBuffer<HeadingState>& heading_state_buffer,
+                    bool has_planner,
+                    PlannerState& planner_state,
+                    DataBuffer<MovementState>& movement_state_buffer,
+                    std::mutex& current_motion_mutex,
+                    bool& report_temperature) override;
+
+  InputType GetType() override { return InputType::NETWORK; }
+
+  bool HasVR3PointControl() const override { return has_vr_3point_control_; }
+
+ private:
+  void DrainSocketAndApplyLatest();
+  bool ApplyJsonPayload(const std::string& json_body);
+  void HandlePlannerModeInput(MotionDataReader& motion_reader,
+                              std::shared_ptr<const MotionSequence>& current_motion,
+                              int& current_frame,
+                              OperatorState& operator_state,
+                              bool& reinitialize_heading,
+                              DataBuffer<HeadingState>& heading_state_buffer,
+                              bool has_planner,
+                              PlannerState& planner_state,
+                              DataBuffer<MovementState>& movement_state_buffer,
+                              std::mutex& current_motion_mutex);
+
+  std::string ipc_path_;
+  std::string topic_;
+  bool disable_joystick_locomotion_;
+  bool zmq_verbose_;
+
+  void* zmq_ctx_ = nullptr;
+  void* zmq_socket_ = nullptr;
+
+  std::mutex planner_mutex_;
+  PlannerMessage latest_planner_message_;
+
+  double facing_yaw_rad_ = 0.0;
+  std::chrono::steady_clock::time_point last_steady_for_dt_{};
+  bool have_last_steady_ = false;
+
+  bool emergency_stop_ = false;
+  bool report_temperature_flag_ = false;
+  bool start_control_ = false;
+  bool stop_control_ = false;
+
+  bool is_planner_ready_ = false;
+  bool last_has_vr_3point_control_ = false;
+
+  /// Keep head position fixed after first valid TeleVuer frame to prevent body tilt from headset motion.
+  bool head_position_locked_ = false;
+  std::array<double, 3> locked_head_position_ = {0.0, 0.0, 0.0};
+
+  /// Increments when a full update cycle had no successful JSON apply; used for rate-limited hints.
+  int no_teledata_log_counter_ = 0;
+
+  // Joystick tuning (aligned with televr_sonic_zmq_bridge.py defaults)
+  static constexpr double kStickDeadZone = 0.12;
+  static constexpr double kStickYawScale = 1.8;
+  static constexpr double kWalkStickMag = 0.72;
+};
+
+#endif  // TELEVUER_PLANNER_INPUT_HPP
