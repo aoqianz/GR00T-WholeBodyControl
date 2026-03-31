@@ -3626,7 +3626,12 @@ class G1Deploy {
           } 
           else {
             if (planner_motion_->timesteps == 0) {
-              std::cout << "Planner() no data in planner_motion_, returning. If control loop is started, this should only happen once when planner is initialized. If control loop is not started, this should keep returning until control loop is started." << std::endl;
+              static int no_planner_motion_log_counter = 0;
+              // Planner thread runs at 10 Hz; avoid flooding stdout while waiting for first trajectory.
+              if (++no_planner_motion_log_counter % 20 == 0) {
+                std::cout << "Planner() no data in planner_motion_, returning (waiting for first trajectory)"
+                          << std::endl;
+              }
               return;
             }
             bool need_replan = false;
@@ -3814,12 +3819,22 @@ class G1Deploy {
       switch (program_state_) {
         case ProgramState::INIT:
           if (!InitControl()) {
-            std::cout << "LowState is not available, waiting for robot to be ready" << std::endl;
+            static int init_wait_log_counter = 0;
+            if (++init_wait_log_counter % 20 == 0) {
+              std::cout << "LowState is not available, waiting for robot to be ready" << std::endl;
+            }
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
           }
           // Re-publish robot_config so late-joining subscribers can receive it
           // before the policy is activated (ZMQ PUB has no persistence).
-          for (auto& oi : output_interfaces_) { if (oi) oi->publish_config(); }
+          {
+            static int init_config_publish_counter = 0;
+            if (++init_config_publish_counter % 50 == 0) {  // ~1 Hz at 50 Hz control loop
+              for (auto& oi : output_interfaces_) {
+                if (oi) oi->publish_config();
+              }
+            }
+          }
           break;
 
         case ProgramState::WAIT_FOR_CONTROL:
@@ -3831,7 +3846,14 @@ class G1Deploy {
 
           // Re-publish robot_config so late-joining subscribers can receive it
           // before the policy is activated (ZMQ PUB has no persistence).
-          for (auto& oi : output_interfaces_) { if (oi) oi->publish_config(); }
+          {
+            static int wait_config_publish_counter = 0;
+            if (++wait_config_publish_counter % 50 == 0) {  // ~1 Hz while waiting for start
+              for (auto& oi : output_interfaces_) {
+                if (oi) oi->publish_config();
+              }
+            }
+          }
           if (operator_state.start) {
             // Warn if starting control in token mode without tokens, but allow it
             if (initial_encoder_mode_ == -1 && !first_token_received_) {

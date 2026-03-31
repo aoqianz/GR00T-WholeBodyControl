@@ -5,6 +5,9 @@
  * Subscribes to the same multipart stream as teleop/televuer (topic + JSON body):
  *   head_pose, left_wrist_pose, right_wrist_pose with 4x4 "matrix".
  * Optional controller thumbsticks map to locomotion (matches televr_sonic_zmq_bridge.py).
+ * VR 3-point: wrists from TeleVuer poses; head XZ locked after first head_pose; head Y = locked Y +
+ *   k * (left_squeeze - right_squeeze) from televuer/zmq_wrapper.py (ctrl: *_ctrl_squeezeValue,
+ *   hand: *_hand_squeezeValue). Head orientation fixed (identity quat).
  *
  * Wire format: televuer/zmq_wrapper.py TeleDataZmqPublisher._build_payload
  */
@@ -12,10 +15,12 @@
 #ifndef TELEVUER_PLANNER_INPUT_HPP
 #define TELEVUER_PLANNER_INPUT_HPP
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <mutex>
 #include <string>
+#include <termios.h>
 
 #include "input_interface.hpp"
 #include "input_command.hpp"
@@ -58,6 +63,7 @@ class TeleVuerPlannerInput : public InputInterface {
  private:
   void DrainSocketAndApplyLatest();
   bool ApplyJsonPayload(const std::string& json_body);
+  void PublishVR3PointFromCaches();
   void HandlePlannerModeInput(MotionDataReader& motion_reader,
                               std::shared_ptr<const MotionSequence>& current_motion,
                               int& current_frame,
@@ -92,17 +98,30 @@ class TeleVuerPlannerInput : public InputInterface {
   bool is_planner_ready_ = false;
   bool last_has_vr_3point_control_ = false;
 
-  /// Keep head position fixed after first valid TeleVuer frame to prevent body tilt from headset motion.
-  bool head_position_locked_ = false;
-  std::array<double, 3> locked_head_position_ = {0.0, 0.0, 0.0};
-
   /// Increments when a full update cycle had no successful JSON apply; used for rate-limited hints.
   int no_teledata_log_counter_ = 0;
+
+  /// Third VR point position: fixed after first valid head_pose (ignores later headset translation).
+  bool head_position_locked_ = false;
+  std::array<double, 3> locked_head_position_{0.0, 0.0, 0.0};
+  std::array<double, 6> cached_wrist_xyz_{};
+  std::array<double, 8> cached_wrist_q_wxyz_{};  // left wxyz + right wxyz
+  bool vr_wrist_cache_valid_ = false;
+
+  /// Latest TeleVuer grip/squeeze analog [0,1] per zmq_wrapper _build_payload (OpenXR squeeze = grip).
+  double last_left_squeeze_ = 0.0;
+  double last_right_squeeze_ = 0.0;
+
+  /// When stdin is a TTY, saved attributes to restore in dtor (see SimpleKeyboard).
+  struct termios stdin_saved_termios_{};
+  bool stdin_tty_raw_mode_ = false;
 
   // Joystick tuning (aligned with televr_sonic_zmq_bridge.py defaults)
   static constexpr double kStickDeadZone = 0.12;
   static constexpr double kStickYawScale = 1.8;
   static constexpr double kWalkStickMag = 0.72;
+  /// Max head Y shift (meters) when one grip is fully squeezed and the other is open (difference ∈ [-1,1]).
+  static constexpr double kHeadGripYScaleM = 0.35;
 };
 
 #endif  // TELEVUER_PLANNER_INPUT_HPP

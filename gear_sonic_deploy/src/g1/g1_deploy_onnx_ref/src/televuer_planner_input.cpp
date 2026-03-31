@@ -4,6 +4,7 @@
 
 #include "input_interface/televuer_planner_input.hpp"
 
+#include <array>
 #include <cerrno>
 #include <cmath>
 #include <cstring>
@@ -102,6 +103,29 @@ void ReadStick2(const nlohmann::json& j, const char* key, double& ox, double& oy
   oy = std::max(-1.0, std::min(1.0, a[1].get<double>()));
 }
 
+double JsonClamp01(const nlohmann::json& j, const char* key) {
+  if (!j.contains(key) || !j[key].is_number()) return 0.0;
+  return std::max(0.0, std::min(1.0, j[key].get<double>()));
+}
+
+/**
+ * televuer/zmq_wrapper.py TeleDataZmqPublisher._build_payload:
+ *  - mode "controller": left_ctrl_squeezeValue / right_ctrl_squeezeValue (grip analog)
+ *  - mode "hand": left_hand_squeezeValue / right_hand_squeezeValue
+ */
+void ReadGripSqueezeValues(const nlohmann::json& j, double& left_sq, double& right_sq) {
+  left_sq = right_sq = 0.0;
+  if (!j.contains("mode") || !j["mode"].is_string()) return;
+  const std::string mode = j["mode"].get<std::string>();
+  if (mode == "controller") {
+    left_sq = JsonClamp01(j, "left_ctrl_squeezeValue");
+    right_sq = JsonClamp01(j, "right_ctrl_squeezeValue");
+  } else if (mode == "hand") {
+    left_sq = JsonClamp01(j, "left_hand_squeezeValue");
+    right_sq = JsonClamp01(j, "right_hand_squeezeValue");
+  }
+}
+
 }  // namespace
 
 TeleVuerPlannerInput::TeleVuerPlannerInput(std::string ipc_path,
@@ -145,8 +169,21 @@ TeleVuerPlannerInput::TeleVuerPlannerInput(std::string ipc_path,
   // Let subscription filter propagate (ipc PUB/SUB slow-joiner edge cases).
   std::this_thread::sleep_for(std::chrono::milliseconds(200));
 
-  // ReadStdinChar() uses read(); without O_NONBLOCK the Input thread can block forever,
-  // and G1Deploy::Stop() will hang on input_thread_ptr_->Wait().
+  // Per-key stdin: canonical mode buffers until Enter, so read() never sees WASD until newline.
+  // Match SimpleKeyboard: non-canonical, no echo, plus O_NONBLOCK for the input thread.
+  if (isatty(STDIN_FILENO)) {
+    if (tcgetattr(STDIN_FILENO, &stdin_saved_termios_) == 0) {
+      struct termios raw = stdin_saved_termios_;
+      raw.c_lflag &= static_cast<tcflag_t>(~(ICANON | ECHO));
+      if (tcsetattr(STDIN_FILENO, TCSANOW, &raw) == 0) {
+        stdin_tty_raw_mode_ = true;
+      } else if (zmq_verbose_) {
+        std::cerr << "[TeleVuerPlannerInput] tcsetattr(ICANON|ECHO off): " << std::strerror(errno) << std::endl;
+      }
+    } else if (zmq_verbose_) {
+      std::cerr << "[TeleVuerPlannerInput] tcgetattr(stdin): " << std::strerror(errno) << std::endl;
+    }
+  }
   {
     const int stdin_flags = fcntl(STDIN_FILENO, F_GETFL);
     if (stdin_flags >= 0) {
@@ -162,9 +199,21 @@ TeleVuerPlannerInput::TeleVuerPlannerInput(std::string ipc_path,
   std::cout << "[TeleVuerPlannerInput] SUB " << ep << " topic='" << topic_ << "' RCVHWM=1" << std::endl;
   std::cout << "  Joystick locomotion: " << (disable_joystick_locomotion_ ? "off" : "on (controller mode)")
             << std::endl;
+  std::cout << "  VR head: XZ+base Y locked from first head_pose; ΔY += " << kHeadGripYScaleM
+            << " m × (left_grip − right_grip) per televuer squeeze fields; head quat identity." << std::endl;
+  if (stdin_tty_raw_mode_) {
+    std::cout << "  Stdin: non-canonical mode (], O, etc. without Enter); restored on exit." << std::endl;
+  } else if (isatty(STDIN_FILENO)) {
+    std::cerr << "[TeleVuerPlannerInput] Warning: could not set stdin raw mode; keys may need Enter."
+              << std::endl;
+  }
 }
 
 TeleVuerPlannerInput::~TeleVuerPlannerInput() {
+  if (stdin_tty_raw_mode_) {
+    tcsetattr(STDIN_FILENO, TCSANOW, &stdin_saved_termios_);
+    stdin_tty_raw_mode_ = false;
+  }
   if (zmq_socket_) {
     zmq_close(zmq_socket_);
     zmq_socket_ = nullptr;
@@ -249,9 +298,12 @@ void TeleVuerPlannerInput::DrainSocketAndApplyLatest() {
 
     zmq_msg_t part1;
     zmq_msg_init(&part1);
-    if (zmq_msg_recv(&part1, zmq_socket_, 0) == -1) {
+    if (zmq_msg_recv(&part1, zmq_socket_, ZMQ_DONTWAIT) == -1) {
       zmq_msg_close(&part0);
       zmq_msg_close(&part1);
+      if (zmq_errno() != EAGAIN && zmq_verbose_) {
+        std::cerr << "[TeleVuerPlannerInput] recv part1 error: " << zmq_strerror(zmq_errno()) << std::endl;
+      }
       break;
     }
 
@@ -311,6 +363,23 @@ void TeleVuerPlannerInput::DrainSocketAndApplyLatest() {
   }
 }
 
+void TeleVuerPlannerInput::PublishVR3PointFromCaches() {
+  if (!vr_wrist_cache_valid_ || !head_position_locked_) return;
+  std::array<double, 9> vr_pos{};
+  std::copy(cached_wrist_xyz_.begin(), cached_wrist_xyz_.end(), vr_pos.begin());
+  vr_pos[6] = locked_head_position_[0];
+  vr_pos[7] =
+      locked_head_position_[1] + kHeadGripYScaleM * (last_left_squeeze_ - last_right_squeeze_);
+  vr_pos[8] = locked_head_position_[2];
+  const std::array<double, 12> vr_ori = {
+      cached_wrist_q_wxyz_[0], cached_wrist_q_wxyz_[1], cached_wrist_q_wxyz_[2], cached_wrist_q_wxyz_[3],
+      cached_wrist_q_wxyz_[4], cached_wrist_q_wxyz_[5], cached_wrist_q_wxyz_[6], cached_wrist_q_wxyz_[7],
+      1.0, 0.0, 0.0, 0.0};
+  vr_3point_position_.SetData(vr_pos);
+  vr_3point_orientation_.SetData(vr_ori);
+  has_vr_3point_control_ = true;
+}
+
 bool TeleVuerPlannerInput::ApplyJsonPayload(const std::string& json_body) {
   nlohmann::json j;
   try {
@@ -338,18 +407,7 @@ bool TeleVuerPlannerInput::ApplyJsonPayload(const std::string& json_body) {
   auto ty = [](const double* T) { return T[7]; };
   auto tz = [](const double* T) { return T[11]; };
 
-  // Freeze head position after first valid frame to keep robot torso/head stable
-  // even when the VR headset moves.
-  if (!head_position_locked_) {
-    locked_head_position_ = {tx(Th), ty(Th), tz(Th)};
-    head_position_locked_ = true;
-    std::cout << "[TeleVuerPlannerInput] Head position locked at ["
-              << locked_head_position_[0] << ", " << locked_head_position_[1] << ", "
-              << locked_head_position_[2] << "] (head motion ignored)" << std::endl;
-  }
-
-  std::array<double, 9> vr_pos = {tx(Tl), ty(Tl), tz(Tl), tx(Tr), ty(Tr), tz(Tr),
-                                  locked_head_position_[0], locked_head_position_[1], locked_head_position_[2]};
+  cached_wrist_xyz_ = {tx(Tl), ty(Tl), tz(Tl), tx(Tr), ty(Tr), tz(Tr)};
 
   double Rl[9] = {Tl[0], Tl[1], Tl[2], Tl[4], Tl[5], Tl[6], Tl[8], Tl[9], Tl[10]};
   double Rr[9] = {Tr[0], Tr[1], Tr[2], Tr[4], Tr[5], Tr[6], Tr[8], Tr[9], Tr[10]};
@@ -358,13 +416,22 @@ bool TeleVuerPlannerInput::ApplyJsonPayload(const std::string& json_body) {
   double qrw = 1, qrx = 0, qry = 0, qrz = 0;
   RotmatToQuatWxyz(Rl, qlw, qlx, qly, qlz);
   RotmatToQuatWxyz(Rr, qrw, qrx, qry, qrz);
-  const double qhw = 1.0, qhx = 0.0, qhy = 0.0, qhz = 0.0;
+  cached_wrist_q_wxyz_ = {qlw, qlx, qly, qlz, qrw, qrx, qry, qrz};
 
-  std::array<double, 12> vr_ori = {qlw, qlx, qly, qlz, qrw, qrx, qry, qrz, qhw, qhx, qhy, qhz};
+  if (!head_position_locked_) {
+    locked_head_position_ = {tx(Th), ty(Th), tz(Th)};
+    head_position_locked_ = true;
+    ReadGripSqueezeValues(j, last_left_squeeze_, last_right_squeeze_);
+    std::cout << "[TeleVuerPlannerInput] Head XY & base Z locked at [" << locked_head_position_[0] << ", "
+              << locked_head_position_[1] << ", " << locked_head_position_[2]
+              << "]; ΔY from grips; orientation identity. Grips L/R=" << last_left_squeeze_ << "/"
+              << last_right_squeeze_ << std::endl;
+  } else {
+    ReadGripSqueezeValues(j, last_left_squeeze_, last_right_squeeze_);
+  }
 
-  vr_3point_position_.SetData(vr_pos);
-  vr_3point_orientation_.SetData(vr_ori);
-  has_vr_3point_control_ = true;
+  vr_wrist_cache_valid_ = true;
+  PublishVR3PointFromCaches();
 
   const auto now = std::chrono::steady_clock::now();
   double dt = 0.005;
@@ -532,6 +599,7 @@ void TeleVuerPlannerInput::HandlePlannerModeInput(MotionDataReader& motion_reade
 
         auto wait_start = std::chrono::steady_clock::now();
         constexpr auto kTimeout = std::chrono::seconds(5);
+        int wait_log_counter = 0;
         while (planner_state.enabled) {
           {
             std::lock_guard<std::mutex> lock(current_motion_mutex);
@@ -543,7 +611,9 @@ void TeleVuerPlannerInput::HandlePlannerModeInput(MotionDataReader& motion_reade
             operator_state.stop = true;
             return;
           }
-          std::cout << "[TeleVuerPlannerInput] Waiting for planner_motion..." << std::endl;
+          if (++wait_log_counter % 10 == 0) {
+            std::cout << "[TeleVuerPlannerInput] Waiting for planner_motion..." << std::endl;
+          }
         }
         if (!planner_state.enabled || !planner_state.initialized) {
           operator_state.stop = true;
@@ -572,6 +642,7 @@ void TeleVuerPlannerInput::HandlePlannerModeInput(MotionDataReader& motion_reade
     }
     auto wait_start = std::chrono::steady_clock::now();
     constexpr auto kTimeout = std::chrono::seconds(5);
+    int wait_log_counter = 0;
     while (planner_state.enabled) {
       {
         std::lock_guard<std::mutex> lock(current_motion_mutex);
@@ -583,7 +654,9 @@ void TeleVuerPlannerInput::HandlePlannerModeInput(MotionDataReader& motion_reade
         operator_state.stop = true;
         return;
       }
-      std::cout << "[TeleVuerPlannerInput] Waiting for planner_motion..." << std::endl;
+      if (++wait_log_counter % 10 == 0) {
+        std::cout << "[TeleVuerPlannerInput] Waiting for planner_motion..." << std::endl;
+      }
     }
     if (!planner_state.enabled || !planner_state.initialized) {
       operator_state.stop = true;
