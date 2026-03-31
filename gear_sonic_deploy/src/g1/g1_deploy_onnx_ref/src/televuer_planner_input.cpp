@@ -10,10 +10,13 @@
 #include <cstring>
 #include <filesystem>
 #include <fcntl.h>
+#include <fstream>
 #include <iostream>
 #include <unistd.h>
 #include <limits>
+#include <sstream>
 #include <thread>
+#include <vector>
 
 #include <nlohmann/json.hpp>
 #include <zmq.h>
@@ -126,6 +129,86 @@ void ReadGripSqueezeValues(const nlohmann::json& j, double& left_sq, double& rig
   }
 }
 
+double LoadYamlVelocityGain(const std::string& config_path, double default_gain) {
+  std::ifstream in(config_path);
+  if (!in.is_open()) return default_gain;
+  std::string line;
+  while (std::getline(in, line)) {
+    const auto comment = line.find('#');
+    if (comment != std::string::npos) line = line.substr(0, comment);
+    const auto key_pos = line.find("velocity_gain");
+    if (key_pos == std::string::npos) continue;
+    const auto colon = line.find(':', key_pos);
+    if (colon == std::string::npos) continue;
+    std::stringstream ss(line.substr(colon + 1));
+    double gain = default_gain;
+    ss >> gain;
+    if (!ss.fail() && std::isfinite(gain) && gain >= 0.0 && gain <= 5.0) {
+      return gain;
+    }
+  }
+  return default_gain;
+}
+
+bool TryParseYamlArray(const std::string& line, const std::string& key, std::vector<double>& out_values) {
+  const auto key_pos = line.find(key);
+  if (key_pos == std::string::npos) return false;
+  const auto colon = line.find(':', key_pos);
+  if (colon == std::string::npos) return false;
+  const auto lb = line.find('[', colon);
+  const auto rb = line.find(']', colon);
+  if (lb == std::string::npos || rb == std::string::npos || rb <= lb) return false;
+  std::stringstream ss(line.substr(lb + 1, rb - lb - 1));
+  out_values.clear();
+  while (ss.good()) {
+    std::string tok;
+    std::getline(ss, tok, ',');
+    if (tok.empty()) continue;
+    std::stringstream vs(tok);
+    double v = 0.0;
+    vs >> v;
+    if (vs.fail() || !std::isfinite(v)) return false;
+    out_values.push_back(v);
+  }
+  return !out_values.empty();
+}
+
+void LoadYamlTrackingConfig(const std::string& config_path,
+                            std::array<double, 2>& tracking_velocity_xy,
+                            std::array<double, 3>& tracking_left_wrist_xyz,
+                            std::array<double, 3>& tracking_right_wrist_xyz,
+                            std::array<double, 4>& tracking_left_wrist_q_wxyz,
+                            std::array<double, 4>& tracking_right_wrist_q_wxyz) {
+  std::ifstream in(config_path);
+  if (!in.is_open()) return;
+  std::string line;
+  while (std::getline(in, line)) {
+    const auto comment = line.find('#');
+    if (comment != std::string::npos) line = line.substr(0, comment);
+    std::vector<double> vals;
+    if (TryParseYamlArray(line, "tracking_velocity_xy", vals) && vals.size() >= 2) {
+      tracking_velocity_xy = {vals[0], vals[1]};
+      continue;
+    }
+    if (TryParseYamlArray(line, "tracking_left_wrist_xyz", vals) && vals.size() >= 3) {
+      tracking_left_wrist_xyz = {vals[0], vals[1], vals[2]};
+      continue;
+    }
+    if (TryParseYamlArray(line, "tracking_right_wrist_xyz", vals) && vals.size() >= 3) {
+      tracking_right_wrist_xyz = {vals[0], vals[1], vals[2]};
+      continue;
+    }
+    if (TryParseYamlArray(line, "tracking_left_wrist_q_wxyz", vals) && vals.size() >= 4) {
+      tracking_left_wrist_q_wxyz = {vals[0], vals[1], vals[2], vals[3]};
+      continue;
+    }
+    if (TryParseYamlArray(line, "tracking_right_wrist_q_wxyz", vals) && vals.size() >= 4) {
+      tracking_right_wrist_q_wxyz = {vals[0], vals[1], vals[2], vals[3]};
+      continue;
+    }
+  }
+}
+
 }  // namespace
 
 TeleVuerPlannerInput::TeleVuerPlannerInput(std::string ipc_path,
@@ -136,6 +219,10 @@ TeleVuerPlannerInput::TeleVuerPlannerInput(std::string ipc_path,
       topic_(std::move(topic)),
       disable_joystick_locomotion_(disable_joystick_locomotion),
       zmq_verbose_(zmq_verbose) {
+  velocity_gain_ = LoadYamlVelocityGain(config_path_, kDefaultVelocityGain);
+  LoadYamlTrackingConfig(config_path_, tracking_velocity_xy_, tracking_left_wrist_xyz_,
+                         tracking_right_wrist_xyz_, tracking_left_wrist_q_wxyz_,
+                         tracking_right_wrist_q_wxyz_);
   type_ = InputType::NETWORK;
   zmq_ctx_ = zmq_ctx_new();
   if (!zmq_ctx_) {
@@ -199,6 +286,9 @@ TeleVuerPlannerInput::TeleVuerPlannerInput(std::string ipc_path,
   std::cout << "[TeleVuerPlannerInput] SUB " << ep << " topic='" << topic_ << "' RCVHWM=1" << std::endl;
   std::cout << "  Joystick locomotion: " << (disable_joystick_locomotion_ ? "off" : "on (controller mode)")
             << std::endl;
+  std::cout << "  velocity_gain (from " << config_path_ << "): " << velocity_gain_ << std::endl;
+  std::cout << "  track mode velocity_xy (from " << config_path_ << "): [" << tracking_velocity_xy_[0]
+            << ", " << tracking_velocity_xy_[1] << "]" << std::endl;
   std::cout << "  VR head: XZ+base Y locked from first head_pose; ΔY += " << kHeadGripYScaleM
             << " m × (left_grip − right_grip) per televuer squeeze fields; head quat identity." << std::endl;
   if (stdin_tty_raw_mode_) {
@@ -366,18 +456,43 @@ void TeleVuerPlannerInput::DrainSocketAndApplyLatest() {
 void TeleVuerPlannerInput::PublishVR3PointFromCaches() {
   if (!vr_wrist_cache_valid_ || !head_position_locked_) return;
   std::array<double, 9> vr_pos{};
-  std::copy(cached_wrist_xyz_.begin(), cached_wrist_xyz_.end(), vr_pos.begin());
+  if (tracking_mode_) {
+    vr_pos[0] = tracking_left_wrist_xyz_[0];
+    vr_pos[1] = tracking_left_wrist_xyz_[1];
+    vr_pos[2] = tracking_left_wrist_xyz_[2];
+    vr_pos[3] = tracking_right_wrist_xyz_[0];
+    vr_pos[4] = tracking_right_wrist_xyz_[1];
+    vr_pos[5] = tracking_right_wrist_xyz_[2];
+  } else {
+    std::copy(cached_wrist_xyz_.begin(), cached_wrist_xyz_.end(), vr_pos.begin());
+  }
   vr_pos[6] = locked_head_position_[0];
   vr_pos[7] =
       locked_head_position_[1] + kHeadGripYScaleM * (last_left_squeeze_ - last_right_squeeze_);
   vr_pos[8] = locked_head_position_[2];
-  const std::array<double, 12> vr_ori = {
-      cached_wrist_q_wxyz_[0], cached_wrist_q_wxyz_[1], cached_wrist_q_wxyz_[2], cached_wrist_q_wxyz_[3],
-      cached_wrist_q_wxyz_[4], cached_wrist_q_wxyz_[5], cached_wrist_q_wxyz_[6], cached_wrist_q_wxyz_[7],
-      1.0, 0.0, 0.0, 0.0};
+  const std::array<double, 12> vr_ori = tracking_mode_
+                                            ? std::array<double, 12>{tracking_left_wrist_q_wxyz_[0],
+                                                                     tracking_left_wrist_q_wxyz_[1],
+                                                                     tracking_left_wrist_q_wxyz_[2],
+                                                                     tracking_left_wrist_q_wxyz_[3],
+                                                                     tracking_right_wrist_q_wxyz_[0],
+                                                                     tracking_right_wrist_q_wxyz_[1],
+                                                                     tracking_right_wrist_q_wxyz_[2],
+                                                                     tracking_right_wrist_q_wxyz_[3],
+                                                                     1.0, 0.0, 0.0, 0.0}
+                                            : std::array<double, 12>{cached_wrist_q_wxyz_[0],
+                                                                     cached_wrist_q_wxyz_[1],
+                                                                     cached_wrist_q_wxyz_[2],
+                                                                     cached_wrist_q_wxyz_[3],
+                                                                     cached_wrist_q_wxyz_[4],
+                                                                     cached_wrist_q_wxyz_[5],
+                                                                     cached_wrist_q_wxyz_[6],
+                                                                     cached_wrist_q_wxyz_[7],
+                                                                     1.0, 0.0, 0.0, 0.0};
   vr_3point_position_.SetData(vr_pos);
   vr_3point_orientation_.SetData(vr_ori);
   has_vr_3point_control_ = true;
+
 }
 
 bool TeleVuerPlannerInput::ApplyJsonPayload(const std::string& json_body) {
@@ -419,13 +534,9 @@ bool TeleVuerPlannerInput::ApplyJsonPayload(const std::string& json_body) {
   cached_wrist_q_wxyz_ = {qlw, qlx, qly, qlz, qrw, qrx, qry, qrz};
 
   if (!head_position_locked_) {
-    locked_head_position_ = {tx(Th), ty(Th), tz(Th)};
+    locked_head_position_ = {tx(Th), 0.0, tz(Th)};
     head_position_locked_ = true;
     ReadGripSqueezeValues(j, last_left_squeeze_, last_right_squeeze_);
-    std::cout << "[TeleVuerPlannerInput] Head XY & base Z locked at [" << locked_head_position_[0] << ", "
-              << locked_head_position_[1] << ", " << locked_head_position_[2]
-              << "]; ΔY from grips; orientation identity. Grips L/R=" << last_left_squeeze_ << "/"
-              << last_right_squeeze_ << std::endl;
   } else {
     ReadGripSqueezeValues(j, last_left_squeeze_, last_right_squeeze_);
   }
@@ -458,14 +569,31 @@ bool TeleVuerPlannerInput::ApplyJsonPayload(const std::string& json_body) {
   msg.speed = -1.0;
   msg.height = -1.0;
 
-  if (!disable_joystick_locomotion_ && controller_mode) {
+  if (tracking_mode_) {
+    const double vx_body = tracking_velocity_xy_[0];
+    const double vy_body = tracking_velocity_xy_[1];
+    const double mag = std::hypot(vx_body, vy_body);
+    if (mag < 1e-6) {
+      msg.mode = static_cast<int>(LocomotionMode::IDLE);
+      msg.movement = {0.0, 0.0, 0.0};
+      msg.facing = {std::cos(facing_yaw_rad_), std::sin(facing_yaw_rad_), 0.0};
+      msg.facing = normalize_vector_d(msg.facing);
+      msg.speed = 0.0;
+    } else {
+      msg.mode = static_cast<int>(LocomotionMode::SLOW_WALK);
+      msg.movement = normalize_vector_d({vx_body, vy_body, 0.0});
+      msg.facing = {std::cos(facing_yaw_rad_), std::sin(facing_yaw_rad_), 0.0};
+      msg.facing = normalize_vector_d(msg.facing);
+      msg.speed = mag;
+    }
+  } else if (!disable_joystick_locomotion_ && controller_mode) {
     facing_yaw_rad_ += rx * kStickYawScale * dt;
     double c = std::cos(facing_yaw_rad_);
     double s = std::sin(facing_yaw_rad_);
     std::array<double, 3> facing = {c, s, 0.0};
 
-    const double vx_body = -jy;
-    const double vy_body = -jx;
+    const double vx_body = -jy * velocity_gain_;
+    const double vy_body = -jx * velocity_gain_;
     const double mag = std::hypot(vx_body, vy_body);
 
     if (mag < kStickDeadZone) {
@@ -480,13 +608,8 @@ bool TeleVuerPlannerInput::ApplyJsonPayload(const std::string& json_body) {
 
       const double mag_n =
           std::min(1.0, (mag - kStickDeadZone) / std::max(1e-6, 1.0 - kStickDeadZone));
-      if (mag < kWalkStickMag) {
-        msg.mode = static_cast<int>(LocomotionMode::SLOW_WALK);
-        msg.speed = 0.22 + 0.55 * mag_n;
-      } else {
-        msg.mode = static_cast<int>(LocomotionMode::WALK);
-        msg.speed = -1.0;
-      }
+      msg.mode = static_cast<int>(LocomotionMode::SLOW_WALK);
+      msg.speed = 0.22 + 0.55 * mag_n;
       msg.movement = movement;
       msg.facing = facing;
     }

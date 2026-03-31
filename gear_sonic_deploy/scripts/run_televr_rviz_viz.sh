@@ -35,6 +35,16 @@ if [[ ! -x "$PYTHON_BIN" ]]; then
   PYTHON_BIN="python3"
 fi
 
+# Ensure ROS/rclpy resolves against system libstdc++ instead of conda's older one.
+ARCH="$(uname -m)"
+SYS_LIB="/usr/lib/${ARCH}-linux-gnu"
+if [[ ! -d "$SYS_LIB" ]]; then
+  SYS_LIB="/usr/lib64"
+fi
+LIB_ROOT="/lib/${ARCH}-linux-gnu"
+[[ -d "$LIB_ROOT" ]] || LIB_ROOT="/lib64"
+export LD_LIBRARY_PATH="${SYS_LIB}:${LIB_ROOT}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+
 IPC="${TELEVR_VIZ_IPC:-/tmp/televuer_teledata.sock}"
 TOPIC="${TELEVR_VIZ_TOPIC:-televuer.teledata}"
 

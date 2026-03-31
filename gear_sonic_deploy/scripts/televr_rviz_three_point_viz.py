@@ -122,6 +122,7 @@ class TeleVuerTeledataZmqSubscriber:
         self._socket.setsockopt(zmq.LINGER, linger_ms)
         self._socket.setsockopt(zmq.SUBSCRIBE, self._topic_bytes)
         self._socket.connect(_ipc_zmq_endpoint(ipc_path))
+        self._last_topic_mismatch_warn_wall = 0.0
 
     def recv_payload(self, timeout_ms: Optional[int] = 1000) -> Optional[Dict[str, Any]]:
         if timeout_ms is not None:
@@ -131,8 +132,20 @@ class TeleVuerTeledataZmqSubscriber:
             if self._socket not in events:
                 return None
 
-        topic_bytes, payload_bytes = self._socket.recv_multipart()
-        if topic_bytes != self._topic_bytes:
+        parts = self._socket.recv_multipart()
+        if len(parts) < 2:
+            return None
+        topic_bytes, payload_bytes = parts[0], parts[1]
+        # Match deploy-side behavior: allow prefix match for topic part.
+        if not topic_bytes.startswith(self._topic_bytes):
+            now = time.time()
+            if now - self._last_topic_mismatch_warn_wall >= 2.0:
+                print(
+                    f"[televr_rviz_viz] ignoring topic '{topic_bytes.decode('utf-8', errors='replace')}', "
+                    f"expected prefix '{self._topic_bytes.decode('utf-8', errors='replace')}'",
+                    flush=True,
+                )
+                self._last_topic_mismatch_warn_wall = now
             return None
         return json.loads(payload_bytes.decode("utf-8"))
 
@@ -305,6 +318,8 @@ class TelevrThreePointVizNode:
         self._tele = TeleVuerTeledataZmqSubscriber(ipc_path=args.teleop_ipc, topic=args.teleop_topic)
 
         self._lat_state: Dict[str, Any] = {"last_print": time.time()}
+        self._last_rx_wall = time.time()
+        self._last_no_data_warn_wall = 0.0
 
         self._timer = self.node.create_timer(args.timer_ms / 1000.0, self._on_timer)
         self.node.get_logger().info(
@@ -316,7 +331,15 @@ class TelevrThreePointVizNode:
         args = self.args
         payload = self._tele.recv_payload(timeout_ms=args.teleop_timeout_ms)
         if payload is None:
+            now_wall = time.time()
+            if now_wall - self._last_no_data_warn_wall >= 2.0 and now_wall - self._last_rx_wall >= 2.0:
+                self.node.get_logger().warning(
+                    "No teleop payload received yet. Ensure TeleVuer is running, VR/web session is connected, "
+                    f"and IPC/topic match (ipc={args.teleop_ipc}, topic={args.teleop_topic})."
+                )
+                self._last_no_data_warn_wall = now_wall
             return
+        self._last_rx_wall = time.time()
 
         now = self.node.get_clock().now().to_msg()
         fixed = args.fixed_frame

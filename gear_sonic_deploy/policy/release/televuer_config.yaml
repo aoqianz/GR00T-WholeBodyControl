@@ -1,0 +1,16 @@
+# TeleVuer runtime config (read by televuer_planner_input.cpp)
+# Joystick translational velocity scale.
+# 1.0 = unchanged, 0.8 = 20% slower
+velocity_gain: 0.6
+
+# Track mode (toggled by left X button / left_ctrl_aButton):
+# constant planar velocity in robot/body frame [vx, vy].
+tracking_velocity_xy: [0.0, 0.0]
+
+# Track mode constant wrist poses for policy 3-point input.
+# Positions are [x, y, z] in the same frame used by policy vr_3point_position.
+tracking_left_wrist_xyz: [0.25, 0.15, 0.25]
+tracking_right_wrist_xyz: [0.25, -0.15, 0.25]
+# Orientations are quaternions [w, x, y, z].
+tracking_left_wrist_q_wxyz: [1.0, 0.0, 0.0, 0.0]
+tracking_right_wrist_q_wxyz: [1.0, 0.0, 0.0, 0.0]

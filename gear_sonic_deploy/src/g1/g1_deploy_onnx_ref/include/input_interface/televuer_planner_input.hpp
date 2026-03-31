@@ -79,6 +79,7 @@ class TeleVuerPlannerInput : public InputInterface {
   std::string topic_;
   bool disable_joystick_locomotion_;
   bool zmq_verbose_;
+  std::string config_path_ = "policy/release/televuer_config.yaml";
 
   void* zmq_ctx_ = nullptr;
   void* zmq_socket_ = nullptr;
@@ -111,6 +112,16 @@ class TeleVuerPlannerInput : public InputInterface {
   /// Latest TeleVuer grip/squeeze analog [0,1] per zmq_wrapper _build_payload (OpenXR squeeze = grip).
   double last_left_squeeze_ = 0.0;
   double last_right_squeeze_ = 0.0;
+  /// False: VR live control; True: track mode with YAML constants.
+  bool tracking_mode_ = false;
+  /// Track-mode constant planar velocity [vx, vy] in robot/body frame.
+  std::array<double, 2> tracking_velocity_xy_{0.0, 0.0};
+  /// Track-mode constant left/right wrist XYZ for policy 3-point input.
+  std::array<double, 3> tracking_left_wrist_xyz_{0.25, 0.15, 0.25};
+  std::array<double, 3> tracking_right_wrist_xyz_{0.25, -0.15, 0.25};
+  /// Track-mode constant left/right wrist quaternions (wxyz).
+  std::array<double, 4> tracking_left_wrist_q_wxyz_{1.0, 0.0, 0.0, 0.0};
+  std::array<double, 4> tracking_right_wrist_q_wxyz_{1.0, 0.0, 0.0, 0.0};
 
   /// When stdin is a TTY, saved attributes to restore in dtor (see SimpleKeyboard).
   struct termios stdin_saved_termios_{};
@@ -120,6 +131,10 @@ class TeleVuerPlannerInput : public InputInterface {
   static constexpr double kStickDeadZone = 0.12;
   static constexpr double kStickYawScale = 1.8;
   static constexpr double kWalkStickMag = 0.72;
+  /// Default joystick translational velocity gain if config is absent/invalid.
+  static constexpr double kDefaultVelocityGain = 0.8;
+  /// Runtime velocity gain loaded from YAML config.
+  double velocity_gain_ = kDefaultVelocityGain;
   /// Max head Y shift (meters) when one grip is fully squeezed and the other is open (difference ∈ [-1,1]).
   static constexpr double kHeadGripYScaleM = 0.35;
 };
